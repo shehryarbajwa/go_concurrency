@@ -9,7 +9,7 @@ type Config struct {
 func NewConfig() *Config {
 	return &Config{
 		DatabaseURL: "postgres://postgres:postgres@localhost:5432/go_concurrency?sslmode=disable",
-		NumWorkers:  10,
+		NumWorkers:  5,
 		DownloadDir: "downloads",
 	}
 }

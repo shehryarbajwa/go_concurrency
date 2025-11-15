@@ -2,93 +2,78 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
-	"io"
-	"net/http"
+	"log"
 	"os"
-	"path/filepath"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
+
+	"concurrent-downloader/config"
+	"concurrent-downloader/database"
+	"concurrent-downloader/models"
+	"concurrent-downloader/worker"
 )
 
-// Job represents a download task
-type Job struct {
-	URL string
-	ID  int
-}
-
 func main() {
-	// Step 1: Read URLs from file
+	fmt.Println("🚀 Starting concurrent downloader...")
+
+	// Load configuration
+	cfg := config.NewConfig()
+
+	// Initialize database
+	db, err := database.NewDB(cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer db.Close()
+
+	// Read URLs from file
 	urls, err := readURLs("urls.txt")
 	if err != nil {
-		fmt.Println("Error reading URLs:", err)
-		return
+		log.Fatalf("Failed to read URLs: %v", err)
 	}
+	fmt.Printf("📋 Loaded %d URLs\n", len(urls))
 
-	// Step 2: Create downloads directory
-	os.MkdirAll("downloads", 0755)
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Create job channel
-	jobs := make(chan Job, len(urls))
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\n🛑 Received shutdown signal, waiting for workers to finish...")
+		cancel()
+	}()
 
+	// Create jobs channel
+	jobs := make(chan models.Job, len(urls))
+
+	// Start worker pool
 	var wg sync.WaitGroup
-
-	// Start 5 workers
-	numWorkers := 5
-	for w := 1; w <= numWorkers; w++ {
-		wg.Add(1)
-		go worker(w, jobs, &wg)
-	}
+	fmt.Printf("👷 Starting %d workers...\n", cfg.NumWorkers)
+	worker.StartWorkerPool(ctx, cfg.NumWorkers, jobs, db, &wg)
 
 	// Send all jobs to channel
 	for i, url := range urls {
-		jobs <- Job{URL: url, ID: i}
+		jobs <- models.Job{
+			URL: url,
+			ID:  i + 1,
+		}
 	}
 	close(jobs) // No more jobs
 
+	// Wait for all workers to finish
 	wg.Wait()
-	fmt.Println("All downloads complete!")
+
+	fmt.Println("\n✅ All downloads complete!")
 }
 
-func worker(id int, jobs <-chan Job, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	// Keep taking jobs from channel until it's closed
-	for job := range jobs {
-		fmt.Printf("Worker %d: starting download %d\n", id, job.ID)
-		downloadFile(job.URL, job.ID)
-	}
-
-	fmt.Printf("Worker %d: finished\n", id)
-}
-
-func downloadFile(url string, id int) {
-	fmt.Printf("Starting download %d: %s\n", id, url)
-
-	resp, err := http.Get(url)
-	if err != nil {
-		fmt.Printf("Error downloading %s: %v\n", url, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	filename := filepath.Join("downloads", fmt.Sprintf("file_%d.json", id))
-	outFile, err := os.Create(filename)
-	if err != nil {
-		fmt.Printf("Error creating file %s: %v\n", filename, err)
-		return
-	}
-	defer outFile.Close()
-
-	_, err = io.Copy(outFile, resp.Body)
-	if err != nil {
-		fmt.Printf("Error saving file %s: %v\n", filename, err)
-		return
-	}
-
-	fmt.Printf("Completed download %d: %s\n", id, filename)
-}
-
+// readURLs reads URLs from a file
 func readURLs(filename string) ([]string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -100,9 +85,14 @@ func readURLs(filename string) ([]string, error) {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
+		if line != "" && !strings.HasPrefix(line, "#") {
 			urls = append(urls, line)
 		}
 	}
-	return urls, scanner.Err()
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return urls, nil
 }
